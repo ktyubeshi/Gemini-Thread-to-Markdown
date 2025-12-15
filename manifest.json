@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Gemini Thread to Markdown",
+  "version": "1.0.0",
+  "description": "Geminiのチャット履歴をMarkdown形式でコピーします。",
+  "permissions": ["activeTab", "scripting", "clipboardWrite"],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
+
