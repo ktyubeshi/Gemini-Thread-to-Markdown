@@ -10,6 +10,12 @@
     <div class="container">
       <h3>Gemini Thread to Markdown</h3>
       <p>現在のスレッドをMarkdownとしてコピーします。</p>
+      <div class="options">
+        <label>
+          <input type="checkbox" id="includeCanvas" checked />
+          Canvasの内容を含める
+        </label>
+      </div>
       <button id="copyBtn">Markdownをコピー</button>
       <div id="status" aria-live="polite"></div>
     </div>

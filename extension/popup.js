@@ -1,5 +1,14 @@
 const copyBtn = document.getElementById("copyBtn");
 const statusDiv = document.getElementById("status");
+const includeCanvasCheckbox = document.getElementById("includeCanvas");
+
+// 設定の読み込み
+document.addEventListener("DOMContentLoaded", () => {
+  const saved = localStorage.getItem("includeCanvas");
+  if (saved !== null) {
+    includeCanvasCheckbox.checked = saved === "true";
+  }
+});
 
 function setStatus(message, { error = false } = {}) {
   statusDiv.textContent = message;
@@ -9,14 +18,25 @@ function setStatus(message, { error = false } = {}) {
 copyBtn.addEventListener("click", async () => {
   setStatus("処理中...");
 
+  // 設定の保存
+  const includeCanvas = includeCanvasCheckbox.checked;
+  localStorage.setItem("includeCanvas", includeCanvas);
+
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id) throw new Error("アクティブなタブを取得できませんでした。");
 
-    const [{ result }] = await chrome.scripting.executeScript({
+    const execPromise = chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: extractMarkdownFromPage,
+      args: [includeCanvas], // 引数として渡す
     });
+
+    const [{ result }] = await withTimeout(
+      execPromise,
+      includeCanvas ? 60_000 : 20_000,
+      "タイムアウトしました。Canvasが多い/開けない状態の可能性があります。必要ならCanvasを手動で開いてから再実行してください。"
+    );
 
     if (!result) throw new Error("会話が見つかりませんでした。");
     if (typeof result === "object" && result.error) throw new Error(result.error);
@@ -30,6 +50,14 @@ copyBtn.addEventListener("click", async () => {
     setStatus(err?.message ?? String(err), { error: true });
   }
 });
+
+function withTimeout(promise, ms, message) {
+  let timerId;
+  const timeout = new Promise((_, reject) => {
+    timerId = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timerId));
+}
 
 async function writeToClipboard(text) {
   try {
@@ -52,7 +80,7 @@ async function writeToClipboard(text) {
   }
 }
 
-function extractMarkdownFromPage() {
+async function extractMarkdownFromPage(includeCanvas) {
   try {
     if (!location.hostname.endsWith("gemini.google.com")) {
       return { error: "Geminiのページではありません。" };
@@ -83,9 +111,517 @@ function extractMarkdownFromPage() {
       output.push("", "---", "");
     }
 
+    // Canvas処理
+    if (includeCanvas) {
+      const canvasSections = await extractAllCanvasContent(root);
+      if (canvasSections.length > 0) {
+        for (const section of canvasSections) {
+          output.push("", "---", "", section);
+        }
+      } else {
+        // 取得できず、かつ参照がある場合は警告
+        const hasCanvasRef = checkForCanvasReference(root);
+        if (hasCanvasRef) {
+          output.push("", "---", "", "> [!WARNING]", "> **Canvas content not found.**", "> Auto-open failed. Please **OPEN the Side Panel MANUALLY** and select the **\"Code\" (コード)** tab.");
+        }
+      }
+    }
+
     return cleanupMarkdown(output.join("\n"));
   } catch (e) {
     return { error: e?.message ?? String(e) };
+  }
+
+
+  async function extractAllCanvasContent(root) {
+    const results = [];
+    const processedTitles = new Set();
+    const processedContentHashes = new Set(); // 内容重複チェック用（念のため）
+
+    const totalStart = Date.now();
+    const MAX_TOTAL_MS = 45_000;
+
+    try {
+      // 1. まず現在の表示を取得してみる
+      let currentContent = getCanvasContent();
+      if (currentContent) {
+        const titleMatch = currentContent.match(/## Canvas: (.*)\n/);
+        const title = titleMatch ? titleMatch[1].trim() : "Untitled";
+        processedTitles.add(title);
+        results.push(currentContent);
+      }
+
+      // 2. サイドバーを開く
+      await ensureSidebarOpen(root);
+      await ensureFileListVisible(root);
+
+      // 3. 「作成済み」等のセクションからファイル名一覧を取得
+      // React/Angularの再レンダリング対策として、要素そのものではなく「タイトル名」で管理する
+      const titles = listCreatedFileTitles(root);
+
+      if (titles.length > 0) {
+        let everOpenedEditor = false;
+
+        // 各タイトルについて、都度要素を探してクリック -> 取得
+        for (const title of titles) {
+          if (Date.now() - totalStart > MAX_TOTAL_MS) break;
+
+          try {
+            const listReady = await ensureFileListVisible(root);
+            if (!listReady) {
+              console.warn("File list is not visible. Aborting canvas extraction loop.");
+              break;
+            }
+
+            // 既に取得済みならスキップ (currentContentで取れている場合など)
+            if (processedTitles.has(title)) continue;
+
+            const clicked = await openFileByTitle(root, title);
+            if (!clicked) {
+              console.warn(`Failed to click file: ${title}`);
+              continue;
+            }
+
+            // サイドバー内のCodeタブを押す (もしあれば)
+            const closeBtn = document.querySelector('button[aria-label="サイドバーを閉じます"], button[aria-label="Close sidebar"]');
+            let sidePanel = null;
+            if (closeBtn) {
+              sidePanel = closeBtn.closest("side-navigation-v2") || closeBtn.closest("aside") || closeBtn.closest(".content");
+            }
+            if (sidePanel) {
+              // Codeタブへの切り替え待ち (少しタイムラグがある場合があるためwaitForに入れる)
+              await waitFor(async () => {
+                ensureCodeTabSelected(sidePanel);
+                return true;
+              }, { timeout: 1000, interval: 200 });
+            }
+
+
+            // コンテンツ取得
+            // DOM上のタイトルが取れなくても、ループ中の title (ファイル名) を正とする
+            const remainingMs = MAX_TOTAL_MS - (Date.now() - totalStart);
+            if (remainingMs <= 0) break;
+            const content = await waitFor(
+              () => {
+                const c = getCanvasContent({ titleFallback: title });
+                // 自明なエラーチェック: まだロード中か？
+                if (!c) return null;
+                return c;
+              },
+              { timeout: Math.min(8000, remainingMs), interval: 200 } // 初回は少し長めでもよい
+            );
+
+            if (content) {
+              results.push(content);
+              processedTitles.add(title);
+              everOpenedEditor = true;
+            } else {
+              // 1度もエディタが開けていないなら、以降も成功確率が低いので早期終了
+              if (!everOpenedEditor) break;
+            }
+
+            const listRestored = await ensureFileListVisible(root);
+            if (!listRestored) {
+              console.warn("Failed to restore file list after reading canvas content.");
+              break;
+            }
+
+          } catch (err) {
+            console.warn(`Error processing file "${title}":`, err);
+          }
+        }
+      } else {
+        // もし「作成済み」セクションが見つからない、または空の場合
+        // 従来のロジック（ボタン総当たり）にフォールバック、または
+        // 単一ファイルとして扱う（既にstep 1で取得済みならOK）
+
+        // フォールバック: 旧来の "items" 取得ロジック
+        const { items, sidePanel } = getCanvasSidebarItems(root);
+        if (items.length > 0) {
+          // ... (既存のループ処理があればここに入れるが、今回はtitlesが取れない＝構造が違う、とみなして無理に深追いしない)
+          // ただし、「作成済み」以外のセクションにあるファイル（Refinedなど）も考慮するなら
+          // ここで getCanvasSidebarItems を呼ぶのもあり。
+          // いったん「作成済み」が空なら何もしない（step 1の結果のみ）
+        }
+
+        // もしボタンで「開く」があるなら（サイドバーじゃなくてチップ表示の場合など）
+        if (results.length === 0) {
+          const opened = await tryClickOpenButton(root);
+          if (opened) {
+            await waitFor(() => getCanvasContent(), { timeout: 3000 });
+            const content = getCanvasContent();
+            if (content) results.push(content);
+          }
+        }
+      }
+
+    } catch (e) {
+      console.warn("Error extracting multiple canvas contents:", e);
+    }
+
+    return results;
+  }
+
+  function findCreatedSectionContainer(root) {
+    const scopes = [];
+    if (root) scopes.push(root);
+    if (root !== document) scopes.push(document);
+
+    const seen = new Set();
+    for (const scope of scopes) {
+      if (!scope || seen.has(scope)) continue;
+      seen.add(scope);
+
+      // 1. "作成済み" (Created) または "ファイル" (Files) 等のセクションヘッダーを探す
+      const headers = Array.from(scope.querySelectorAll("div.section-header, div.gds-title-s"));
+      const targetHeader = headers.find((el) => {
+        const text = (el.textContent || "").trim();
+        return text === "作成済み" || text === "Created" || text === "Files" || text === "ファイル";
+      });
+      if (!targetHeader) continue;
+
+      // 2. その直後の source-container を探す
+      // DOM構造: header + div.source-container
+      let container = targetHeader.nextElementSibling;
+      while (container && !container.classList.contains("source-container")) {
+        container = container.nextElementSibling;
+        // あまりに離れすぎていたら諦める
+        if (!container || container.tagName === "SECTION" || container.classList.contains("section-header")) {
+          container = null;
+          break;
+        }
+      }
+
+      if (container) return { container, scope };
+    }
+
+    return { container: null, scope: null };
+  }
+
+  function listCreatedFileTitles(root) {
+    const { container } = findCreatedSectionContainer(root);
+    if (!container) {
+      // セクションが見つからない場合、もしかしたらセクション分けがないかも？
+      // その場合は sidebar-immersive-chip 全体から取る策もあるが、誤爆避けのため慎重に。
+      // いったん空を返す（フォールバックへ）
+      return [];
+    }
+
+    if (!isElementVisible(container)) return [];
+
+    // 3. コンテナ内のチップからタイトルを収集
+    const titleEls = Array.from(container.querySelectorAll("sidebar-immersive-chip .immersive-title"));
+    const titles = titleEls.map(el => (el.textContent || "").trim()).filter(t => t.length > 0);
+
+    // 重複排除して返す
+    return Array.from(new Set(titles));
+  }
+
+  async function openFileByTitle(root, title) {
+    // 再検索：タイトルに一致するチップを探してクリック
+    // listCreatedFileTitles と同じロジックでコンテナを特定
+    const { container } = findCreatedSectionContainer(root);
+    if (!container || !isElementVisible(container)) return false;
+
+    // コンテナ内でタイトル一致するチップを探す
+    // 完全一致で検索
+    const chips = Array.from(container.querySelectorAll("sidebar-immersive-chip"));
+    const targetChip = chips.find(chip => {
+      const titleEl = chip.querySelector(".immersive-title");
+      return titleEl && (titleEl.textContent || "").trim() === title;
+    });
+
+    if (targetChip) {
+      // 仮想スクロール対策：見えていないとクリックできないことがあるためスクロールさせる
+      // Click target correction: the actual clickable element is often inside the chip
+      const clickable = targetChip.querySelector(".container, .clickable") || targetChip;
+      clickable.scrollIntoView({ block: "center", behavior: "auto" });
+      clickable.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+      return true;
+    }
+
+    return false;
+  }
+
+  async function ensureSidebarOpen(root) {
+    // サイドバーが開いているか確認（閉じるボタンがあるか）
+    const closeSidebarBtn = document.querySelector('button[aria-label="サイドバーを閉じます"], button[aria-label="Close sidebar"]');
+    if (closeSidebarBtn) return; // 既に開いている
+
+    // Studioサイドバーを開くボタン（厳密に指定）
+    const openSidebarBtn = document.querySelector('button[aria-label="Studio のサイドバーを切り替える"], button[aria-label="Toggle Studio sidebar"]');
+    if (openSidebarBtn) {
+      openSidebarBtn.click();
+      await waitFor(() => {
+        const closeBtn = document.querySelector(
+          'button[aria-label="サイドバーを閉じます"], button[aria-label="Close sidebar"]'
+        );
+        return !!closeBtn;
+      }, { timeout: 2000 });
+    }
+  }
+
+  function isElementVisible(el) {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
+      return false;
+    }
+    return el.getClientRects().length > 0;
+  }
+
+  function isFileListVisible(root) {
+    const { container } = findCreatedSectionContainer(root);
+    return !!(container && isElementVisible(container));
+  }
+
+  function findSidePanel() {
+    // 1. 閉じるボタンから親を辿るのが最も確実
+    const closeBtn = document.querySelector(
+      'button[aria-label="サイドバーを閉じます"], button[aria-label="Close sidebar"]'
+    );
+    if (closeBtn) {
+      return (
+        closeBtn.closest("side-navigation-v2") ||
+        closeBtn.closest("aside") ||
+        closeBtn.closest(".content")
+      );
+    }
+
+    // 2. もし見つからなければ、"ファイル"や"作成済み"を含む side-navigation-v2 を探す
+    const candidates = Array.from(document.querySelectorAll("side-navigation-v2, aside"));
+    return candidates.find((el) => {
+      const text = el.textContent || "";
+      return (
+        (text.includes("ファイル") && !text.includes("チャット")) ||
+        (text.includes("Files") && !text.includes("Chat")) ||
+        text.includes("作成済み") ||
+        text.includes("Created")
+      );
+    }) || null;
+  }
+
+  function clickBackButton(scope) {
+    if (!scope) return false;
+    const backSelectors = [
+      'button[aria-label*="戻る"]',
+      'button[aria-label*="Back"]',
+      'button[title*="戻る"]',
+      'button[title*="Back"]',
+    ];
+    const labeled = scope.querySelector(backSelectors.join(","));
+    if (labeled) {
+      labeled.click();
+      return true;
+    }
+
+    const icon = Array.from(scope.querySelectorAll("button mat-icon")).find((el) => {
+      const name = (el.textContent || "").trim();
+      return (
+        name === "arrow_back" ||
+        name === "arrow_back_ios" ||
+        name === "chevron_left" ||
+        name === "keyboard_backspace"
+      );
+    });
+    if (icon) {
+      const btn = icon.closest("button");
+      if (btn) {
+        btn.click();
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function clickFilesTab(scope) {
+    if (!scope) return false;
+    const buttons = Array.from(scope.querySelectorAll('button[role="tab"], button[role="radio"], button'));
+    const target = buttons.find((btn) => {
+      const text = (btn.textContent || "").trim();
+      const label = (btn.getAttribute("aria-label") || "").trim();
+      const value = text || label;
+      if (!value) return false;
+      if (value.includes("サイドバー") || value.includes("sidebar")) return false;
+      return (
+        value === "ファイル" ||
+        value === "Files" ||
+        value.includes("ファイル一覧") ||
+        value.includes("Files list")
+      );
+    });
+    if (target) {
+      target.click();
+      return true;
+    }
+    return false;
+  }
+
+  async function ensureFileListVisible(root) {
+    if (isFileListVisible(root)) return true;
+
+    const sidePanel = findSidePanel();
+    if (sidePanel) {
+      if (clickBackButton(sidePanel)) {
+        const ok = await waitFor(() => isFileListVisible(root), { timeout: 1500, interval: 100 });
+        if (ok) return true;
+      }
+      if (clickFilesTab(sidePanel)) {
+        const ok = await waitFor(() => isFileListVisible(root), { timeout: 1500, interval: 100 });
+        if (ok) return true;
+      }
+    }
+
+    // Fallback: サイドバーを閉じて開き直す
+    const closeBtn = document.querySelector(
+      'button[aria-label="サイドバーを閉じます"], button[aria-label="Close sidebar"]'
+    );
+    if (closeBtn) {
+      closeBtn.click();
+      await waitFor(() => !document.querySelector(
+        'button[aria-label="サイドバーを閉じます"], button[aria-label="Close sidebar"]'
+      ), { timeout: 1500, interval: 100 });
+    }
+    await ensureSidebarOpen(root);
+    return isFileListVisible(root);
+  }
+
+  async function waitFor(fn, { timeout = 8000, interval = 100 } = {}) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      try {
+        const result = await fn();
+        if (result) return result;
+      } catch (e) {
+        // ignore transient errors
+      }
+      await new Promise((r) => setTimeout(r, interval));
+    }
+    return null;
+  }
+
+  function getCanvasSidebarItems(root) {
+    const sidePanel = findSidePanel();
+
+    // フォールバック: 全体探索は危険なのでやめる。見つからなければ空を返す。
+    if (!sidePanel) return { items: [], sidePanel: null };
+
+    // ボタン取得
+    // fallbackとして使うので一応残すが、メインは listCreatedFileTitles に移行したため
+    // 使われないが、万が一のために残しておく
+    const buttons = Array.from(sidePanel.querySelectorAll("button"));
+    const items = buttons.filter((btn) => {
+      const text = (btn.textContent || "").trim();
+      const aria = (btn.getAttribute("aria-label") || "").toLowerCase();
+
+      // まずアイコンだけのボタンは落とす（closeなどが混ざる可能性）
+      // ただし、ファイル名がアイコンのみで表現されることは稀なので、textありが前提
+      if (!text) return false;
+
+      // 明確に除外したい操作系
+      if (aria.includes("close") || aria.includes("閉じ")) return false;
+      if (aria.includes("toggle") || aria.includes("切り替え")) return false;
+      if (text === "閉じる" || text === "Close") return false;
+
+      // ファイル名っぽいものだけ (拡張子がある、または特定のキーワードがないなど)
+      // 厳格に拡張子チェックをする
+      return /\.(html|css|js|py|json|ts|jsx|tsx|java|c|cpp|txt|md|sql|rb|go|rs|php)$/i.test(
+        text
+      );
+    });
+
+    return { items, sidePanel };
+  }
+
+  function ensureCodeTabSelected(scopeEl) {
+    // "Code" (コード) タブを探してクリック
+    // scopeElがあればそこから、なければ全体から（ただし全体は危険なので極力scopeを使う）
+    const root = scopeEl || document;
+    const tabs = Array.from(
+      root.querySelectorAll('button[role="tab"], button[role="radio"]')
+    );
+    const codeTab = tabs.find(
+      (t) =>
+        (t.textContent || "").includes("Code") ||
+        (t.textContent || "").includes("コード")
+    );
+    if (
+      codeTab &&
+      codeTab.getAttribute("aria-selected") !== "true" &&
+      codeTab.getAttribute("aria-pressed") !== "true"
+    ) {
+      codeTab.click();
+    }
+  }
+
+  async function tryClickOpenButton(root) {
+    const openButtons = Array.from(root.querySelectorAll('button'));
+    const targetBtn = openButtons.find(b => {
+      const text = (b.textContent || "").trim();
+      return text === "開く" || text === "Open" || b.getAttribute("aria-label")?.includes("Canvas");
+    });
+    if (targetBtn) {
+      targetBtn.click();
+      return true;
+    }
+    return false;
+  }
+
+  function checkForCanvasReference(root) {
+    // 「開く」ボタンやアーティファクトのチップを探す簡易チェック
+    // クラス名は変わりやすいため、テキストやaria-labelも補助的に使う
+    const candidates = Array.from(root.querySelectorAll('button, [role="button"], mat-chip'));
+    return candidates.some(el => {
+      const text = (el.textContent || "").trim();
+      const label = (el.getAttribute("aria-label") || "").trim();
+      return (
+        text.includes("Canvas") ||
+        text === "開く" ||
+        text === "Open" ||
+        label.includes("Canvas") ||
+        (text.endsWith(".html") || text.endsWith(".js") || text.endsWith(".py")) && el.closest('.artifact-chip')
+      );
+    });
+  }
+
+  function getCanvasContent({ titleFallback } = {}) {
+    try {
+      // Monaco Editor の行を取得
+      // 複数開いている場合に備えて、まずアクティブっぽいものを探したいが、
+      // 基本的には .monaco-editor は Canvas内にしかないはず（Geminiのチャット欄はMonacoではない）
+      // ただし、scopeを渡せればベスト。ここではdocumentから取る。
+
+      const lines = Array.from(
+        document.querySelectorAll(".monaco-editor .view-line")
+      );
+      if (lines.length === 0) return null;
+
+      // タイトル（ファイル名）の取得を試みる
+      let title = titleFallback || "Canvas Content";
+      if (!titleFallback) {
+        const titleEl = document.querySelector('div[class*="title-m"]');
+        if (titleEl && titleEl.textContent) {
+          title = titleEl.textContent.trim();
+        }
+      }
+
+      const codeLines = lines.map((line) => line.textContent).join("\n");
+
+      // 言語推定（簡易的）
+      let lang = "";
+      if (title.endsWith(".js") || title.endsWith(".ts")) lang = "javascript";
+      else if (title.endsWith(".py")) lang = "python";
+      else if (title.endsWith(".html")) lang = "html";
+      else if (title.endsWith(".css")) lang = "css";
+      else if (title.endsWith(".json")) lang = "json";
+      else if (title.endsWith(".md")) lang = "markdown";
+
+      return `## Canvas: ${title}\n\n\`\`\`${lang}\n${codeLines}\n\`\`\``;
+    } catch (e) {
+      console.warn("Canvas content extraction failed:", e);
+      return null;
+    }
   }
 
   function getThreadTitle() {
@@ -464,4 +1000,5 @@ function extractMarkdownFromPage() {
       .replace(/\n{3,}/g, "\n\n")
       .trim();
   }
+
 }
