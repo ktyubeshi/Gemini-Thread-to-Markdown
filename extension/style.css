@@ -1,5 +1,5 @@
 body {
-  width: 260px;
+  width: 300px;
   font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
   padding: 10px;
   background-color: #f8f9fa;
@@ -23,6 +23,7 @@ p {
   text-align: center;
   margin: 0;
   color: #666;
+  white-space: nowrap;
 }
 
 button {
@@ -52,4 +53,3 @@ button:hover {
 .error {
   color: #d93025 !important;
 }
-
