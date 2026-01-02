@@ -133,7 +133,148 @@ async function extractMarkdownFromPage(includeCanvas) {
   }
 
 
+  function captureUiState(root) {
+    const closeBtnSel =
+      'button[aria-label="サイドバーを閉じます"], button[aria-label="Close sidebar"]';
+    const sidebarWasOpen = !!document.querySelector(closeBtnSel);
+    const sidePanel = sidebarWasOpen ? findSidePanel() : null;
+
+    const windowScroll = { x: window.scrollX, y: window.scrollY };
+
+    const activeSidebarTabLabel = (() => {
+      if (!sidePanel) return null;
+      const tabs = Array.from(sidePanel.querySelectorAll('button[role="tab"], button[role="radio"]'));
+      const active = tabs.find((t) =>
+        t.getAttribute("aria-selected") === "true" || t.getAttribute("aria-pressed") === "true"
+      );
+      const label = (active?.textContent || active?.getAttribute("aria-label") || "").trim();
+      return label || null;
+    })();
+
+    const hadMonacoOpen = !!document.querySelector(".monaco-editor .view-line");
+    const currentCanvasTitle = (() => {
+      const titleEl = document.querySelector('div[class*="title-m"]');
+      const title = (titleEl?.textContent || "").trim();
+      return title || null;
+    })();
+
+    const sidePanelScrollTop = sidePanel ? sidePanel.scrollTop : null;
+
+    const { container: createdContainer } = findCreatedSectionContainer(root) || {};
+    const fileListScrollTop =
+      createdContainer && typeof createdContainer.scrollTop === "number"
+        ? createdContainer.scrollTop
+        : null;
+
+    const monacoScrollable = document.querySelector(".monaco-editor .scrollable-element");
+    const monacoScroll = monacoScrollable
+      ? { top: monacoScrollable.scrollTop, left: monacoScrollable.scrollLeft }
+      : null;
+
+    const immersivePanelOpen = isImmersivePanelOpen();
+
+    return {
+      sidebarWasOpen,
+      activeSidebarTabLabel,
+      hadMonacoOpen,
+      currentCanvasTitle,
+      windowScroll,
+      sidePanelScrollTop,
+      fileListScrollTop,
+      monacoScroll,
+      immersivePanelOpen,
+    };
+  }
+
+  async function restoreUiState(root, state) {
+    const closeBtnSel =
+      'button[aria-label="サイドバーを閉じます"], button[aria-label="Close sidebar"]';
+    const shouldCloseImmersive = !state?.immersivePanelOpen;
+
+    try {
+      if (state?.windowScroll) {
+        window.scrollTo(state.windowScroll.x, state.windowScroll.y);
+      }
+
+      if (!state?.sidebarWasOpen) {
+        const closeBtn = document.querySelector(closeBtnSel);
+        if (closeBtn) {
+          closeBtn.click();
+          await waitFor(() => !document.querySelector(closeBtnSel), {
+            timeout: 1500,
+            interval: 100,
+          });
+        }
+        if (shouldCloseImmersive) {
+          await closeImmersivePanel();
+        }
+        return;
+      }
+
+      await ensureSidebarOpen(root);
+      const sidePanel = findSidePanel();
+
+      if (state.hadMonacoOpen && state.currentCanvasTitle) {
+        await ensureFileListVisible(root);
+        await openFileByTitle(root, state.currentCanvasTitle);
+
+        if (sidePanel) ensureCodeTabSelected(sidePanel);
+
+        if (state.monacoScroll) {
+          await waitFor(() => document.querySelector(".monaco-editor .scrollable-element"), {
+            timeout: 1500,
+            interval: 100,
+          });
+          const monacoScrollable = document.querySelector(".monaco-editor .scrollable-element");
+          if (monacoScrollable) {
+            monacoScrollable.scrollTop = state.monacoScroll.top;
+            monacoScrollable.scrollLeft = state.monacoScroll.left;
+          }
+        }
+      } else {
+        if (sidePanel && state.activeSidebarTabLabel) {
+          const tabs = Array.from(sidePanel.querySelectorAll('button[role="tab"], button[role="radio"]'));
+          const target = tabs.find((t) => {
+            const label = ((t.textContent || "") || (t.getAttribute("aria-label") || "")).trim();
+            return label === state.activeSidebarTabLabel;
+          });
+          target?.click();
+        }
+
+        if (!state.hadMonacoOpen) {
+          const monacoOpen = !!document.querySelector(".monaco-editor .view-line");
+          if (monacoOpen && sidePanel) {
+            if (!clickBackButton(sidePanel)) {
+              clickFilesTab(sidePanel);
+            }
+            await waitFor(() => !document.querySelector(".monaco-editor .view-line"), {
+              timeout: 1500,
+              interval: 100,
+            });
+          }
+        }
+
+        if (typeof state.fileListScrollTop === "number") {
+          await ensureFileListVisible(root);
+          const { container } = findCreatedSectionContainer(root) || {};
+          if (container) container.scrollTop = state.fileListScrollTop;
+        }
+      }
+
+      if (sidePanel && typeof state.sidePanelScrollTop === "number") {
+        sidePanel.scrollTop = state.sidePanelScrollTop;
+      }
+
+      if (shouldCloseImmersive) {
+        await closeImmersivePanel();
+      }
+    } catch (e) {
+      console.warn("UI restore failed (best-effort):", e);
+    }
+  }
+
   async function extractAllCanvasContent(root) {
+    const uiState = captureUiState(root);
     const results = [];
     const processedTitles = new Set();
     const processedContentHashes = new Set(); // 内容重複チェック用（念のため）
@@ -142,124 +283,134 @@ async function extractMarkdownFromPage(includeCanvas) {
     const MAX_TOTAL_MS = 45_000;
 
     try {
-      // 1. まず現在の表示を取得してみる
-      let currentContent = getCanvasContent();
-      if (currentContent) {
-        const titleMatch = currentContent.match(/## Canvas: (.*)\n/);
-        const title = titleMatch ? titleMatch[1].trim() : "Untitled";
-        processedTitles.add(title);
-        results.push(currentContent);
-      }
+      try {
+        // 1. まず現在の表示を取得してみる
+        let currentContent = getCanvasContent();
+        if (currentContent) {
+          const titleMatch = currentContent.match(/## Canvas: (.*)\n/);
+          const title = titleMatch ? titleMatch[1].trim() : "Untitled";
+          processedTitles.add(title);
+          results.push(currentContent);
+        }
 
-      // 2. サイドバーを開く
-      await ensureSidebarOpen(root);
-      await ensureFileListVisible(root);
+        // 2. サイドバーを開く
+        await ensureSidebarOpen(root);
+        await ensureFileListVisible(root);
 
-      // 3. 「作成済み」等のセクションからファイル名一覧を取得
-      // React/Angularの再レンダリング対策として、要素そのものではなく「タイトル名」で管理する
-      const titles = listCreatedFileTitles(root);
+        // 3. 「作成済み」等のセクションからファイル名一覧を取得
+        // React/Angularの再レンダリング対策として、要素そのものではなく「タイトル名」で管理する
+        const titles = listCreatedFileTitles(root);
 
-      if (titles.length > 0) {
-        let everOpenedEditor = false;
+        if (titles.length > 0) {
+          let everOpenedEditor = false;
 
-        // 各タイトルについて、都度要素を探してクリック -> 取得
-        for (const title of titles) {
-          if (Date.now() - totalStart > MAX_TOTAL_MS) break;
+          // 各タイトルについて、都度要素を探してクリック -> 取得
+          for (const title of titles) {
+            if (Date.now() - totalStart > MAX_TOTAL_MS) break;
 
-          try {
-            const listReady = await ensureFileListVisible(root);
-            if (!listReady) {
-              console.warn("File list is not visible. Aborting canvas extraction loop.");
-              break;
+            try {
+              const listReady = await ensureFileListVisible(root);
+              if (!listReady) {
+                console.warn("File list is not visible. Aborting canvas extraction loop.");
+                break;
+              }
+
+              // 既に取得済みならスキップ (currentContentで取れている場合など)
+              if (processedTitles.has(title)) continue;
+
+              const clicked = await openFileByTitle(root, title);
+              if (!clicked) {
+                console.warn(`Failed to click file: ${title}`);
+                continue;
+              }
+
+              // サイドバー内のCodeタブを押す (もしあれば)
+              const closeBtn = document.querySelector(
+                'button[aria-label="サイドバーを閉じます"], button[aria-label="Close sidebar"]'
+              );
+              let sidePanel = null;
+              if (closeBtn) {
+                sidePanel =
+                  closeBtn.closest("side-navigation-v2") ||
+                  closeBtn.closest("aside") ||
+                  closeBtn.closest(".content");
+              }
+              if (sidePanel) {
+                // Codeタブへの切り替え待ち (少しタイムラグがある場合があるためwaitForに入れる)
+                await waitFor(
+                  async () => {
+                    ensureCodeTabSelected(sidePanel);
+                    return true;
+                  },
+                  { timeout: 1000, interval: 200 }
+                );
+              }
+
+              // コンテンツ取得
+              // DOM上のタイトルが取れなくても、ループ中の title (ファイル名) を正とする
+              const remainingMs = MAX_TOTAL_MS - (Date.now() - totalStart);
+              if (remainingMs <= 0) break;
+              const content = await waitFor(
+                () => {
+                  const c = getCanvasContent({ titleFallback: title });
+                  // 自明なエラーチェック: まだロード中か？
+                  if (!c) return null;
+                  return c;
+                },
+                { timeout: Math.min(8000, remainingMs), interval: 200 } // 初回は少し長めでもよい
+              );
+
+              if (content) {
+                results.push(content);
+                processedTitles.add(title);
+                everOpenedEditor = true;
+              } else {
+                // 1度もエディタが開けていないなら、以降も成功確率が低いので早期終了
+                if (!everOpenedEditor) break;
+              }
+
+              const listRestored = await ensureFileListVisible(root);
+              if (!listRestored) {
+                console.warn("Failed to restore file list after reading canvas content.");
+                break;
+              }
+
+            } catch (err) {
+              console.warn(`Error processing file "${title}":`, err);
             }
+          }
+        } else {
+          // もし「作成済み」セクションが見つからない、または空の場合
+          // 従来のロジック（ボタン総当たり）にフォールバック、または
+          // 単一ファイルとして扱う（既にstep 1で取得済みならOK）
 
-            // 既に取得済みならスキップ (currentContentで取れている場合など)
-            if (processedTitles.has(title)) continue;
+          // フォールバック: 旧来の "items" 取得ロジック
+          const { items, sidePanel } = getCanvasSidebarItems(root);
+          if (items.length > 0) {
+            // ... (既存のループ処理があればここに入れるが、今回はtitlesが取れない＝構造が違う、とみなして無理に深追いしない)
+            // ただし、「作成済み」以外のセクションにあるファイル（Refinedなど）も考慮するなら
+            // ここで getCanvasSidebarItems を呼ぶのもあり。
+            // いったん「作成済み」が空なら何もしない（step 1の結果のみ）
+          }
 
-            const clicked = await openFileByTitle(root, title);
-            if (!clicked) {
-              console.warn(`Failed to click file: ${title}`);
-              continue;
+          // もしボタンで「開く」があるなら（サイドバーじゃなくてチップ表示の場合など）
+          if (results.length === 0) {
+            const opened = await tryClickOpenButton(root);
+            if (opened) {
+              await waitFor(() => getCanvasContent(), { timeout: 3000 });
+              const content = getCanvasContent();
+              if (content) results.push(content);
             }
-
-            // サイドバー内のCodeタブを押す (もしあれば)
-            const closeBtn = document.querySelector('button[aria-label="サイドバーを閉じます"], button[aria-label="Close sidebar"]');
-            let sidePanel = null;
-            if (closeBtn) {
-              sidePanel = closeBtn.closest("side-navigation-v2") || closeBtn.closest("aside") || closeBtn.closest(".content");
-            }
-            if (sidePanel) {
-              // Codeタブへの切り替え待ち (少しタイムラグがある場合があるためwaitForに入れる)
-              await waitFor(async () => {
-                ensureCodeTabSelected(sidePanel);
-                return true;
-              }, { timeout: 1000, interval: 200 });
-            }
-
-
-            // コンテンツ取得
-            // DOM上のタイトルが取れなくても、ループ中の title (ファイル名) を正とする
-            const remainingMs = MAX_TOTAL_MS - (Date.now() - totalStart);
-            if (remainingMs <= 0) break;
-            const content = await waitFor(
-              () => {
-                const c = getCanvasContent({ titleFallback: title });
-                // 自明なエラーチェック: まだロード中か？
-                if (!c) return null;
-                return c;
-              },
-              { timeout: Math.min(8000, remainingMs), interval: 200 } // 初回は少し長めでもよい
-            );
-
-            if (content) {
-              results.push(content);
-              processedTitles.add(title);
-              everOpenedEditor = true;
-            } else {
-              // 1度もエディタが開けていないなら、以降も成功確率が低いので早期終了
-              if (!everOpenedEditor) break;
-            }
-
-            const listRestored = await ensureFileListVisible(root);
-            if (!listRestored) {
-              console.warn("Failed to restore file list after reading canvas content.");
-              break;
-            }
-
-          } catch (err) {
-            console.warn(`Error processing file "${title}":`, err);
           }
         }
-      } else {
-        // もし「作成済み」セクションが見つからない、または空の場合
-        // 従来のロジック（ボタン総当たり）にフォールバック、または
-        // 単一ファイルとして扱う（既にstep 1で取得済みならOK）
-
-        // フォールバック: 旧来の "items" 取得ロジック
-        const { items, sidePanel } = getCanvasSidebarItems(root);
-        if (items.length > 0) {
-          // ... (既存のループ処理があればここに入れるが、今回はtitlesが取れない＝構造が違う、とみなして無理に深追いしない)
-          // ただし、「作成済み」以外のセクションにあるファイル（Refinedなど）も考慮するなら
-          // ここで getCanvasSidebarItems を呼ぶのもあり。
-          // いったん「作成済み」が空なら何もしない（step 1の結果のみ）
-        }
-
-        // もしボタンで「開く」があるなら（サイドバーじゃなくてチップ表示の場合など）
-        if (results.length === 0) {
-          const opened = await tryClickOpenButton(root);
-          if (opened) {
-            await waitFor(() => getCanvasContent(), { timeout: 3000 });
-            const content = getCanvasContent();
-            if (content) results.push(content);
-          }
-        }
+      } catch (e) {
+        console.warn("Error extracting multiple canvas contents:", e);
       }
 
-    } catch (e) {
-      console.warn("Error extracting multiple canvas contents:", e);
+      return results;
+    } finally {
+      await restoreUiState(root, uiState);
     }
-
-    return results;
   }
 
   function findCreatedSectionContainer(root) {
@@ -272,27 +423,28 @@ async function extractMarkdownFromPage(includeCanvas) {
       if (!scope || seen.has(scope)) continue;
       seen.add(scope);
 
-      // 1. "作成済み" (Created) または "ファイル" (Files) 等のセクションヘッダーを探す
+      // 1. 言語非依存: source-container 内に sidebar-immersive-chip があるものを優先
+      const containers = Array.from(scope.querySelectorAll("div.source-container"));
+      const chipContainer = containers.find((c) => c.querySelector("sidebar-immersive-chip"));
+      if (chipContainer) return { container: chipContainer, scope };
+
+      // 2. 見つからなければ従来ヘッダーに紐づく source-container を探す（多言語対応しつつフォールバック）
       const headers = Array.from(scope.querySelectorAll("div.section-header, div.gds-title-s"));
       const targetHeader = headers.find((el) => {
-        const text = (el.textContent || "").trim();
-        return text === "作成済み" || text === "Created" || text === "Files" || text === "ファイル";
+        const text = (el.textContent || "").trim().toLowerCase();
+        return ["作成済み", "created", "files", "ファイル"].includes(text);
       });
-      if (!targetHeader) continue;
-
-      // 2. その直後の source-container を探す
-      // DOM構造: header + div.source-container
-      let container = targetHeader.nextElementSibling;
-      while (container && !container.classList.contains("source-container")) {
-        container = container.nextElementSibling;
-        // あまりに離れすぎていたら諦める
-        if (!container || container.tagName === "SECTION" || container.classList.contains("section-header")) {
-          container = null;
-          break;
+      if (targetHeader) {
+        let container = targetHeader.nextElementSibling;
+        while (container && !container.classList.contains("source-container")) {
+          container = container.nextElementSibling;
+          if (!container || container.tagName === "SECTION" || container.classList.contains("section-header")) {
+            container = null;
+            break;
+          }
         }
+        if (container) return { container, scope };
       }
-
-      if (container) return { container, scope };
     }
 
     return { container: null, scope: null };
@@ -344,20 +496,25 @@ async function extractMarkdownFromPage(includeCanvas) {
   }
 
   async function ensureSidebarOpen(root) {
-    // サイドバーが開いているか確認（閉じるボタンがあるか）
-    const closeSidebarBtn = document.querySelector('button[aria-label="サイドバーを閉じます"], button[aria-label="Close sidebar"]');
-    if (closeSidebarBtn) return; // 既に開いている
+    const closeBtnSel =
+      'button[aria-label="サイドバーを閉じます"], button[aria-label="Close sidebar"]';
 
-    // Studioサイドバーを開くボタン（厳密に指定）
-    const openSidebarBtn = document.querySelector('button[aria-label="Studio のサイドバーを切り替える"], button[aria-label="Toggle Studio sidebar"]');
+    // サイドバーが開いているか確認（要素が可視ならOK）
+    const sidePanel = findSidePanel();
+    if (sidePanel && isElementVisible(sidePanel)) return;
+
+    const closeSidebarBtn = document.querySelector(closeBtnSel);
+    if (closeSidebarBtn) return; // 既に開いている（ボタンがある）
+
+    const openSidebarBtn = findSidebarToggleButton();
+
     if (openSidebarBtn) {
       openSidebarBtn.click();
       await waitFor(() => {
-        const closeBtn = document.querySelector(
-          'button[aria-label="サイドバーを閉じます"], button[aria-label="Close sidebar"]'
-        );
-        return !!closeBtn;
-      }, { timeout: 2000 });
+        const closeBtn = document.querySelector(closeBtnSel);
+        const panel = findSidePanel();
+        return !!(closeBtn || (panel && isElementVisible(panel)));
+      }, { timeout: 2500 });
     }
   }
 
@@ -375,10 +532,102 @@ async function extractMarkdownFromPage(includeCanvas) {
     return !!(container && isElementVisible(container));
   }
 
+  function getMatIconName(el) {
+    if (!el) return "";
+    const iconEl = el.matches?.("mat-icon, [data-mat-icon-name]") ? el : el.querySelector?.("mat-icon, [data-mat-icon-name]");
+    if (!iconEl) return "";
+    const attr =
+      (iconEl.getAttribute("data-mat-icon-name") ||
+        iconEl.getAttribute("fonticon") ||
+        "").trim().toLowerCase();
+    const text = (iconEl.textContent || "").trim().toLowerCase();
+    return attr || text;
+  }
+
+  function buttonHasIcon(button, names = []) {
+    if (!button) return false;
+    const name = getMatIconName(button);
+    if (!name) return false;
+    return names.some((n) => name === n.toLowerCase());
+  }
+
+  function findSidebarToggleButton() {
+    // 最優先: data-test-id で特定（言語非依存、意図したボタンのみ）
+    const dataTestIcon = document.querySelector('mat-icon[data-test-id="studio-sidebar-icon"]');
+    if (dataTestIcon) {
+      const btn = dataTestIcon.closest("button");
+      if (btn) return btn;
+    }
+
+    const explicit = document.querySelector("studio-sidebar-button button");
+    if (explicit) return explicit;
+
+    const candidates = Array.from(document.querySelectorAll("button"));
+    return (
+      candidates.find((btn) => {
+        // サイドナビ内やメインメニューのトグルは避ける
+        if (btn.closest("side-navigation-v2, nav")) {
+          if (buttonHasIcon(btn, ["menu"])) return false;
+        }
+        const aria = (btn.getAttribute("aria-label") || "").toLowerCase();
+        if (aria.includes("sidebar")) return true;
+        // アイコンで判定（home_storage が最も安定）
+        if (buttonHasIcon(btn, ["home_storage", "folder_open"])) return true;
+        return false;
+      }) || null
+    );
+  }
+
+  function findImmersivePanel() {
+    return (
+      document.querySelector("code-immersive-panel") ||
+      document.querySelector("immersive-panel")
+    );
+  }
+
+  function isImmersivePanelOpen() {
+    const panel = findImmersivePanel();
+    return !!(panel && isElementVisible(panel));
+  }
+
+  async function closeImmersivePanel() {
+    const panel = findImmersivePanel();
+    if (!panel) return true;
+
+    const buttonSelectors = [
+      "button.close-button",
+      'button[aria-label*="閉じる"]',
+      'button[aria-label*="Close"]',
+      'button[aria-label*="close"]',
+      'button[title*="閉じる"]',
+      'button[title*="Close"]',
+    ];
+
+    let closeBtn =
+      panel.querySelector(buttonSelectors.join(",")) ||
+      Array.from(panel.querySelectorAll("button"))
+        .find((btn) => buttonHasIcon(btn, ["close", "cancel", "clear"])) ||
+      (() => {
+        const matIcon = panel.querySelector('[data-mat-icon-name="close"]');
+        return matIcon?.closest("button") || null;
+      })();
+
+    if (closeBtn) {
+      closeBtn.click();
+      const closed = await waitFor(() => !isImmersivePanelOpen(), {
+        timeout: 2000,
+        interval: 100,
+      });
+      return !!closed;
+    }
+
+    return !isImmersivePanelOpen();
+  }
+
   function findSidePanel() {
-    // 1. 閉じるボタンから親を辿るのが最も確実
+    // 1. 閉じるボタンから親を辿る（ロケール依存しないアイコンでクリック済みでも最も確実）
     const closeBtn = document.querySelector(
-      'button[aria-label="サイドバーを閉じます"], button[aria-label="Close sidebar"]'
+      'button[aria-label="サイドバーを閉じます"], button[aria-label="Close sidebar"], button.close-button'
     );
     if (closeBtn) {
       return (
@@ -388,17 +637,29 @@ async function extractMarkdownFromPage(includeCanvas) {
       );
     }
 
-    // 2. もし見つからなければ、"ファイル"や"作成済み"を含む side-navigation-v2 を探す
+    // 2. 構造ベースで side-navigation-v2 / aside を優先
     const candidates = Array.from(document.querySelectorAll("side-navigation-v2, aside"));
-    return candidates.find((el) => {
-      const text = el.textContent || "";
+    const withContent = candidates.find((el) => {
       return (
-        (text.includes("ファイル") && !text.includes("チャット")) ||
-        (text.includes("Files") && !text.includes("Chat")) ||
-        text.includes("作成済み") ||
-        text.includes("Created")
+        el.querySelector(".source-container") ||
+        el.querySelector("sidebar-immersive-chip") ||
+        el.querySelector("[data-section-id]")
       );
-    }) || null;
+    });
+    if (withContent) return withContent;
+
+    // 3. テキストベースは最後のフォールバック（ロケール依存）
+    return (
+      candidates.find((el) => {
+        const text = el.textContent || "";
+        return (
+          (text.includes("ファイル") && !text.includes("チャット")) ||
+          (text.includes("Files") && !text.includes("Chat")) ||
+          text.includes("作成済み") ||
+          text.includes("Created")
+        );
+      }) || null
+    );
   }
 
   function clickBackButton(scope) {

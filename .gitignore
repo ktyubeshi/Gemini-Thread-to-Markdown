@@ -1,1 +1,3 @@
+# Hidden directories (dot-prefixed)
+.*/
 *.DS_Store
