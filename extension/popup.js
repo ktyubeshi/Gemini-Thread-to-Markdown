@@ -757,7 +757,7 @@ async function extractMarkdownFromPage(includeCanvas) {
         "button",
         "svg",
         "mat-icon",
-        "script",
+        // "script", // MathJax sometimes uses script[type="math/tex"], so handle carefully below
         "style",
         "textarea",
         "input",
@@ -767,8 +767,27 @@ async function extractMarkdownFromPage(includeCanvas) {
         ".speech_icon",
       ];
       for (const sel of removeSelectors) {
-        rootEl.querySelectorAll(sel).forEach((el) => el.remove());
+        rootEl.querySelectorAll(sel).forEach((el) => {
+          // Preserve math scripts
+          if (el.tagName.toLowerCase() === "script" && (
+            el.type.includes("math") || el.type.includes("tex")
+          )) {
+            return;
+          }
+          // Preserve math-related svgs if they are inside a known math container (handled by main traversal)
+          // But strict removal of 'svg' here is risky if the math engine uses SVG. 
+          // However, usually we want to extract the *source* NOT the SVG.
+          // So we keep removing SVG, assuming we will find the source in a sibling or parent attribute.
+          el.remove();
+        });
       }
+
+      // Separate pass to remove generic scripts but keep math ones
+      rootEl.querySelectorAll("script").forEach(el => {
+        if (!el.type.includes("math") && !el.type.includes("tex")) {
+          el.remove();
+        }
+      });
     }
 
     function convertChildren(parent, ctx) {
@@ -879,7 +898,68 @@ async function extractMarkdownFromPage(includeCanvas) {
         return `${trimmed}\n\n`;
       }
 
+      // Math / LaTeX handling
+      if (
+        tag === "math" ||
+        el.classList.contains("katex") ||
+        el.classList.contains("mjx-container") ||
+        el.classList.contains("MathJax") ||
+        el.classList.contains("math-inline") ||
+        el.classList.contains("math-block")
+      ) {
+        const latex = extractLatex(el);
+        if (latex) {
+          const isBlock = el.classList.contains("block-math") ||
+            el.classList.contains("math-block") ||
+            el.style.display === "block" ||
+            tag === "div" ||
+            el.getAttribute("display") === "block";
+
+          // Wrap in $$ for block, $ for inline
+          // Normalize spacing
+          const cleanTex = latex.trim();
+          if (isBlock) {
+            return `\n$$\n${cleanTex}\n$$\n\n`;
+          } else {
+            return `$${cleanTex}$`;
+          }
+        }
+        // If extraction fails, fall through to default processing (might just be text)
+      }
+
       return combined;
+    }
+
+    function extractLatex(el) {
+      // 1. Look for data-math (Gemini specific) or similar
+      const dataMath = el.getAttribute("data-math") || el.getAttribute("data-tex");
+      if (dataMath) return dataMath;
+
+      // 2. Look for <annotation encoding="application/x-tex"> (MathML standard)
+      const annotation = el.querySelector('annotation[encoding="application/x-tex"]');
+      if (annotation && annotation.textContent) {
+        return annotation.textContent;
+      }
+
+      // 2. Look for data attributes
+      const dataTex = el.getAttribute("data-tex") || el.getAttribute("alt") || el.getAttribute("aria-label");
+      if (dataTex && (dataTex.includes("\\") || dataTex.includes("="))) {
+        // Simple heuristic to avoid using "image" or generic labels as latex
+        return dataTex;
+      }
+
+      // 3. Look for script tags (MathJax)
+      const script = el.querySelector('script[type^="math/tex"]');
+      if (script && script.textContent) {
+        return script.textContent;
+      }
+
+      // 4. KaTeX often has a visually hidden element with the source
+      // .katex-mathml contains the mathml which might have annotation
+      // .katex-html is consistent but visual only
+      // Sometimes just innerText of a specific hidden span works
+
+      return null;
     }
 
     function isBlockLike(tag) {
