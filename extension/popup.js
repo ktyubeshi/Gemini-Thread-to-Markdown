@@ -28,6 +28,7 @@ copyBtn.addEventListener("click", async () => {
 
     const execPromise = chrome.scripting.executeScript({
       target: { tabId: tab.id },
+      world: "MAIN",
       func: extractMarkdownFromPage,
       args: [includeCanvas], // 引数として渡す
     });
@@ -285,7 +286,7 @@ async function extractMarkdownFromPage(includeCanvas) {
     try {
       try {
         // 1. まず現在の表示を取得してみる
-        let currentContent = getCanvasContent();
+        let currentContent = await getCanvasContent();
         if (currentContent) {
           const titleMatch = currentContent.match(/## Canvas: (.*)\n/);
           const title = titleMatch ? titleMatch[1].trim() : "Untitled";
@@ -351,9 +352,8 @@ async function extractMarkdownFromPage(includeCanvas) {
               const remainingMs = MAX_TOTAL_MS - (Date.now() - totalStart);
               if (remainingMs <= 0) break;
               const content = await waitFor(
-                () => {
-                  const c = getCanvasContent({ titleFallback: title });
-                  // 自明なエラーチェック: まだロード中か？
+                async () => {
+                  const c = await getCanvasContent({ titleFallback: title });
                   if (!c) return null;
                   return c;
                 },
@@ -397,8 +397,8 @@ async function extractMarkdownFromPage(includeCanvas) {
           if (results.length === 0) {
             const opened = await tryClickOpenButton(root);
             if (opened) {
-              await waitFor(() => getCanvasContent(), { timeout: 3000 });
-              const content = getCanvasContent();
+      await waitFor(() => getCanvasContent(), { timeout: 3000 });
+      const content = await getCanvasContent();
               if (content) results.push(content);
             }
           }
@@ -849,17 +849,33 @@ async function extractMarkdownFromPage(includeCanvas) {
     });
   }
 
-  function getCanvasContent({ titleFallback } = {}) {
+  async function getCanvasContent({ titleFallback } = {}) {
     try {
       // 1) Monaco のモデルから直接取得（最も確実）
       ensureCodeTabSelected(document);
       const monacoContent = getMonacoModelContent();
       let codeText = monacoContent?.code || null;
       let lang = monacoContent?.lang || "";
+      let lineCount = monacoContent?.lineCount ?? null;
 
-      // 2) モデルが取れない場合、DOMをスクロールしながら全行を吸い上げる
-      if (!codeText) {
-        codeText = readMonacoDomText();
+      // 2) モデルが取れない場合、または行数が極端に少ない場合は DOM をスクロールしながら全行を吸い上げる
+      if (!codeText || (lineCount !== null && lineCount <= 1)) {
+        const domText = await readMonacoDomText();
+        if (domText) {
+          codeText = domText;
+          const domLines = domText.split("\n").length;
+          if (lineCount !== null && domLines > 1) {
+            lineCount = domLines;
+          }
+        }
+      }
+
+      // 3) それでも1行しかない場合は、再トライしてみる（プレビュー→コード切替直後の遅延対策）
+      if (codeText && codeText.split("\n").length <= 1) {
+        const retryDom = await readMonacoDomText();
+        if (retryDom && retryDom.split("\n").length > 1) {
+          codeText = retryDom;
+        }
       }
 
       if (!codeText) return null;
@@ -912,30 +928,36 @@ async function extractMarkdownFromPage(includeCanvas) {
         model.getLanguageId?.() ||
         model._languageIdentifier?.language ||
         "";
+      const lineCount = model.getLineCount?.() || null;
 
-      return { code, lang: langId };
+      return { code, lang: langId, lineCount };
     } catch (e) {
       console.warn("Failed to read Monaco model content:", e);
       return null;
     }
   }
 
-  function readMonacoDomText() {
+  async function readMonacoDomText() {
+    // 可視のMonaco editorに限定（Previewで隠れているeditorを拾わない）
+    const editorRoot =
+      Array.from(document.querySelectorAll(".monaco-editor")).find((el) => isElementVisible(el)) ||
+      null;
+    if (!editorRoot) return null;
+
     const readLines = () =>
-      Array.from(document.querySelectorAll(".monaco-editor .view-lines .view-line")).map((n) =>
+      Array.from(editorRoot.querySelectorAll(".view-lines .view-line")).map((n) =>
         (n.textContent || "").replace(/\s+$/, "")
       );
 
+    const scrollable = editorRoot.querySelector(".scrollable-element");
     let lines = readLines();
-    if (lines.length > 0 && lines.join("").trim().length > 0 && lines.length > 1) {
-      return lines.join("\n");
+    if (!scrollable) {
+      const text = lines.join("\n").trim();
+      return text || null;
     }
 
-    const scrollable = document.querySelector(".monaco-editor .scrollable-element");
-    if (!scrollable) return lines.join("\n") || null;
-
     const originalTop = scrollable.scrollTop;
-    const max = scrollable.scrollHeight;
+    const maxTop = Math.max(0, scrollable.scrollHeight - scrollable.clientHeight);
     const step = Math.max(200, Math.floor(scrollable.clientHeight * 0.8));
     const collected = [];
 
@@ -946,13 +968,17 @@ async function extractMarkdownFromPage(includeCanvas) {
       }
     };
 
-    // スクロールしながら行を収集
+    const nextFrame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+    // スクロールしながら行を収集（描画反映を待ちながら）
     pushLines();
-    for (let pos = 0; pos <= max; pos += step) {
+    for (let pos = 0; pos <= maxTop; pos += step) {
       scrollable.scrollTop = pos;
+      await nextFrame();
       pushLines();
     }
-    scrollable.scrollTop = max;
+    scrollable.scrollTop = maxTop;
+    await nextFrame();
     pushLines();
     scrollable.scrollTop = originalTop; // 可能な範囲で元位置に戻す
 
