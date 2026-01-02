@@ -851,23 +851,18 @@ async function extractMarkdownFromPage(includeCanvas) {
 
   function getCanvasContent({ titleFallback } = {}) {
     try {
-      // Monaco Editor の行を取得。プレビュー表示になっている場合は Code タブを選択して再取得する。
-      let lines = Array.from(document.querySelectorAll(".monaco-editor .view-line"));
-      if (lines.length === 0) {
-        ensureCodeTabSelected(document);
-        lines = Array.from(document.querySelectorAll(".monaco-editor .view-line"));
-        if (lines.length === 0) {
-          // 少し待ってから再トライ
-          // waitFor が非同期なので同期呼び出しできないため簡易wait
-          // (全体の withTimeout 内で十分なタイムアウトがあるため短時間のみ)
-          const start = Date.now();
-          while (Date.now() - start < 600) {
-            lines = Array.from(document.querySelectorAll(".monaco-editor .view-line"));
-            if (lines.length > 0) break;
-          }
-        }
+      // 1) Monaco のモデルから直接取得（最も確実）
+      ensureCodeTabSelected(document);
+      const monacoContent = getMonacoModelContent();
+      let codeText = monacoContent?.code || null;
+      let lang = monacoContent?.lang || "";
+
+      // 2) モデルが取れない場合、DOMをスクロールしながら全行を吸い上げる
+      if (!codeText) {
+        codeText = readMonacoDomText();
       }
-      if (lines.length === 0) return null;
+
+      if (!codeText) return null;
 
       // タイトル（ファイル名）の取得を試みる
       let title = titleFallback || "Canvas Content";
@@ -878,22 +873,99 @@ async function extractMarkdownFromPage(includeCanvas) {
         }
       }
 
-      const codeLines = lines.map((line) => line.textContent).join("\n");
+      // 言語推定（モデルが教えてくれた場合を優先）
+      if (!lang) {
+        if (title.endsWith(".js") || title.endsWith(".ts")) lang = "javascript";
+        else if (title.endsWith(".py")) lang = "python";
+        else if (title.endsWith(".html")) lang = "html";
+        else if (title.endsWith(".css")) lang = "css";
+        else if (title.endsWith(".json")) lang = "json";
+        else if (title.endsWith(".md")) lang = "markdown";
+      }
 
-      // 言語推定（簡易的）
-      let lang = "";
-      if (title.endsWith(".js") || title.endsWith(".ts")) lang = "javascript";
-      else if (title.endsWith(".py")) lang = "python";
-      else if (title.endsWith(".html")) lang = "html";
-      else if (title.endsWith(".css")) lang = "css";
-      else if (title.endsWith(".json")) lang = "json";
-      else if (title.endsWith(".md")) lang = "markdown";
-
-      return `## Canvas: ${title}\n\n\`\`\`${lang}\n${codeLines}\n\`\`\``;
+      return `## Canvas: ${title}\n\n\`\`\`${lang}\n${codeText}\n\`\`\``;
     } catch (e) {
       console.warn("Canvas content extraction failed:", e);
       return null;
     }
+  }
+
+  function getMonacoModelContent() {
+    try {
+      const monacoApi = window.monaco;
+      if (!monacoApi?.editor?.getModels) return null;
+      const models = monacoApi.editor.getModels();
+      if (!models || models.length === 0) return null;
+
+      // 行数が最も多いモデルを選択（表示中エディタのモデルは多くの場合最長）
+      const model = models.reduce((best, m) => {
+        const count = m.getLineCount?.() || 0;
+        if (!best || count > (best.count || 0)) {
+          return { ref: m, count };
+        }
+        return best;
+      }, null)?.ref;
+
+      if (!model?.getValue) return null;
+      const code = model.getValue();
+      const langId =
+        model.getLanguageId?.() ||
+        model._languageIdentifier?.language ||
+        "";
+
+      return { code, lang: langId };
+    } catch (e) {
+      console.warn("Failed to read Monaco model content:", e);
+      return null;
+    }
+  }
+
+  function readMonacoDomText() {
+    const readLines = () =>
+      Array.from(document.querySelectorAll(".monaco-editor .view-lines .view-line")).map((n) =>
+        (n.textContent || "").replace(/\s+$/, "")
+      );
+
+    let lines = readLines();
+    if (lines.length > 0 && lines.join("").trim().length > 0 && lines.length > 1) {
+      return lines.join("\n");
+    }
+
+    const scrollable = document.querySelector(".monaco-editor .scrollable-element");
+    if (!scrollable) return lines.join("\n") || null;
+
+    const originalTop = scrollable.scrollTop;
+    const max = scrollable.scrollHeight;
+    const step = Math.max(200, Math.floor(scrollable.clientHeight * 0.8));
+    const collected = [];
+
+    const pushLines = () => {
+      const chunk = readLines();
+      for (const l of chunk) {
+        collected.push(l);
+      }
+    };
+
+    // スクロールしながら行を収集
+    pushLines();
+    for (let pos = 0; pos <= max; pos += step) {
+      scrollable.scrollTop = pos;
+      pushLines();
+    }
+    scrollable.scrollTop = max;
+    pushLines();
+    scrollable.scrollTop = originalTop; // 可能な範囲で元位置に戻す
+
+    // 連続重複を圧縮（仮想スクロールの重複対策）
+    const compressed = [];
+    for (const l of collected) {
+      if (compressed.length === 0 || compressed[compressed.length - 1] !== l) {
+        compressed.push(l);
+      }
+    }
+
+    const text = compressed.join("\n").trim();
+    return text || null;
   }
 
   function getThreadTitle() {
