@@ -173,6 +173,7 @@ async function extractMarkdownFromPage(includeCanvas) {
       : null;
 
     const immersivePanelOpen = isImmersivePanelOpen();
+    const canvasActiveTab = getCanvasActiveTab();
 
     return {
       sidebarWasOpen,
@@ -184,6 +185,7 @@ async function extractMarkdownFromPage(includeCanvas) {
       fileListScrollTop,
       monacoScroll,
       immersivePanelOpen,
+      canvasActiveTab,
     };
   }
 
@@ -259,6 +261,14 @@ async function extractMarkdownFromPage(includeCanvas) {
           await ensureFileListVisible(root);
           const { container } = findCreatedSectionContainer(root) || {};
           if (container) container.scrollTop = state.fileListScrollTop;
+        }
+      }
+
+      // Canvasタブの復元（プレビュー/コード）
+      if (state.canvasActiveTab) {
+        const panel = findImmersivePanel();
+        if (panel && isElementVisible(panel)) {
+          selectCanvasTab(panel, state.canvasActiveTab);
         }
       }
 
@@ -588,6 +598,44 @@ async function extractMarkdownFromPage(includeCanvas) {
   function isImmersivePanelOpen() {
     const panel = findImmersivePanel();
     return !!(panel && isElementVisible(panel));
+  }
+
+  function getCanvasActiveTab() {
+    const panel = findImmersivePanel();
+    if (!panel) return null;
+    const tabs = Array.from(panel.querySelectorAll('button[role="tab"], button[role="radio"]'));
+    const active = tabs.find((t) => {
+      const attrs = [
+        t.getAttribute("aria-selected"),
+        t.getAttribute("aria-pressed"),
+        t.getAttribute("aria-checked"),
+      ];
+      return attrs.some((v) => v === "true");
+    });
+    if (!active) return null;
+    const text = (active.textContent || "").toLowerCase();
+    if (text.includes("preview") || text.includes("プレビュー")) return "preview";
+    if (text.includes("code") || text.includes("コード")) return "code";
+    return null;
+  }
+
+  function selectCanvasTab(panel, tabName) {
+    if (!panel || !tabName) return;
+    const tabs = Array.from(panel.querySelectorAll('button[role="tab"], button[role="radio"]'));
+    const target = tabs.find((t) => {
+      const text = (t.textContent || "").toLowerCase();
+      if (tabName === "preview") return text.includes("preview") || text.includes("プレビュー");
+      if (tabName === "code") return text.includes("code") || text.includes("コード");
+      return false;
+    });
+    if (!target) return;
+    const attrs = [
+      target.getAttribute("aria-selected"),
+      target.getAttribute("aria-pressed"),
+      target.getAttribute("aria-checked"),
+    ];
+    const already = attrs.some((v) => v === "true");
+    if (!already) target.click();
   }
 
   async function closeImmersivePanel() {
