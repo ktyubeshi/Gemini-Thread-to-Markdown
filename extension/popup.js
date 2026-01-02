@@ -796,22 +796,25 @@ async function extractMarkdownFromPage(includeCanvas) {
   }
 
   function ensureCodeTabSelected(scopeEl) {
-    // "Code" (コード) タブを探してクリック
-    // scopeElがあればそこから、なければ全体から（ただし全体は危険なので極力scopeを使う）
+    // "Code" (コード) タブ/トグルを探してクリック
+    // role="tab" or role="radio" を優先。mat-button-toggle-group にも対応。
     const root = scopeEl || document;
     const tabs = Array.from(
       root.querySelectorAll('button[role="tab"], button[role="radio"]')
     );
-    const codeTab = tabs.find(
-      (t) =>
-        (t.textContent || "").includes("Code") ||
-        (t.textContent || "").includes("コード")
-    );
-    if (
-      codeTab &&
-      codeTab.getAttribute("aria-selected") !== "true" &&
-      codeTab.getAttribute("aria-pressed") !== "true"
-    ) {
+    const codeTab = tabs.find((t) => {
+      const text = (t.textContent || "").trim();
+      return text.includes("Code") || text.includes("コード");
+    });
+    if (!codeTab) return;
+
+    const selectedStates = [
+      codeTab.getAttribute("aria-selected"),
+      codeTab.getAttribute("aria-pressed"),
+      codeTab.getAttribute("aria-checked"),
+    ];
+    const isSelected = selectedStates.some((v) => v === "true");
+    if (!isSelected) {
       codeTab.click();
     }
   }
@@ -848,14 +851,22 @@ async function extractMarkdownFromPage(includeCanvas) {
 
   function getCanvasContent({ titleFallback } = {}) {
     try {
-      // Monaco Editor の行を取得
-      // 複数開いている場合に備えて、まずアクティブっぽいものを探したいが、
-      // 基本的には .monaco-editor は Canvas内にしかないはず（Geminiのチャット欄はMonacoではない）
-      // ただし、scopeを渡せればベスト。ここではdocumentから取る。
-
-      const lines = Array.from(
-        document.querySelectorAll(".monaco-editor .view-line")
-      );
+      // Monaco Editor の行を取得。プレビュー表示になっている場合は Code タブを選択して再取得する。
+      let lines = Array.from(document.querySelectorAll(".monaco-editor .view-line"));
+      if (lines.length === 0) {
+        ensureCodeTabSelected(document);
+        lines = Array.from(document.querySelectorAll(".monaco-editor .view-line"));
+        if (lines.length === 0) {
+          // 少し待ってから再トライ
+          // waitFor が非同期なので同期呼び出しできないため簡易wait
+          // (全体の withTimeout 内で十分なタイムアウトがあるため短時間のみ)
+          const start = Date.now();
+          while (Date.now() - start < 600) {
+            lines = Array.from(document.querySelectorAll(".monaco-editor .view-line"));
+            if (lines.length > 0) break;
+          }
+        }
+      }
       if (lines.length === 0) return null;
 
       // タイトル（ファイル名）の取得を試みる
